@@ -14,11 +14,13 @@ import torch.nn as nn
 import os
 import numpy as np
 from timm.models.layers import DropPath
-from timm.models.vision_transformer import PatchEmbed, Mlp
+from timm.models.vision_transformer import PatchEmbed
 
+import comfy.ops
+ops = comfy.ops.disable_weight_init
 
-from .utils import auto_grad_checkpoint, to_2tuple
-from .PixArt_blocks import t2i_modulate, CaptionEmbedder, WindowAttention, MultiHeadCrossAttention, T2IFinalLayer, TimestepEmbedder, LabelEmbedder, FinalLayer
+from .utils import to_2tuple #, auto_grad_checkpoint
+from .PixArt_blocks import t2i_modulate, CaptionEmbedder, WindowAttention, MultiHeadCrossAttention, T2IFinalLayer, TimestepEmbedder, FinalLayer, Mlp
 
 
 class PixArtBlock(nn.Module):
@@ -26,17 +28,17 @@ class PixArtBlock(nn.Module):
     A PixArt block with adaptive layer norm (adaLN-single) conditioning.
     """
 
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, drop_path=0., window_size=0, input_size=None, use_rel_pos=False, **block_kwargs):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, drop_path=0., window_size=0, input_size=None, use_rel_pos=False, dtype=None, device=None, operations=ops, **block_kwargs):
         super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm1 = operations.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
         self.attn = WindowAttention(hidden_size, num_heads=num_heads, qkv_bias=True,
                                     input_size=input_size if window_size == 0 else (window_size, window_size),
                                     use_rel_pos=use_rel_pos, **block_kwargs)
         self.cross_attn = MultiHeadCrossAttention(hidden_size, num_heads, **block_kwargs)
-        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm2 = operations.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
         # to be compatible with lower version pytorch
         approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=int(hidden_size * mlp_ratio), act_layer=approx_gelu, drop=0)
+        self.mlp = Mlp(in_features=hidden_size, hidden_features=int(hidden_size * mlp_ratio), act_layer=approx_gelu, drop=0, dtype=dtype, device=device)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.window_size = window_size
         self.scale_shift_table = nn.Parameter(torch.randn(6, hidden_size) / hidden_size ** 0.5)
@@ -78,6 +80,9 @@ class PixArt(nn.Module):
             caption_channels=4096,
             lewei_scale=1.0,
             config=None,
+            dtype=None,
+            device=None,
+            operations=ops,
             **kwargs,
     ):
         super().__init__()
@@ -87,10 +92,11 @@ class PixArt(nn.Module):
         self.patch_size = patch_size
         self.num_heads = num_heads
         self.lewei_scale = lewei_scale,
-        self.dtype = torch.get_default_dtype()
+        self.dtype = dtype
+        self.device = device
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
-        self.t_embedder = TimestepEmbedder(hidden_size)
+        self.t_embedder = TimestepEmbedder(hidden_size, dtype=dtype, device=device, operations=operations)
         num_patches = self.x_embedder.num_patches
         self.base_size = input_size // self.patch_size
         # Will use fixed sin-cos embedding:
@@ -99,20 +105,21 @@ class PixArt(nn.Module):
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.t_block = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+            operations.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
-        self.y_embedder = CaptionEmbedder(in_channels=caption_channels, hidden_size=hidden_size, uncond_prob=class_dropout_prob, act_layer=approx_gelu)
+        self.y_embedder = CaptionEmbedder(in_channels=caption_channels, hidden_size=hidden_size, uncond_prob=class_dropout_prob, act_layer=approx_gelu, dtype=dtype, device=device, operations=operations)
         drop_path = [x.item() for x in torch.linspace(0, drop_path, depth)]  # stochastic depth decay rule
         self.blocks = nn.ModuleList([
             PixArtBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, drop_path=drop_path[i],
                           input_size=(input_size // patch_size, input_size // patch_size),
                           window_size=window_size if i in window_block_indexes else 0,
-                          use_rel_pos=use_rel_pos if i in window_block_indexes else False)
+                          use_rel_pos=use_rel_pos if i in window_block_indexes else False,
+                          dtype=dtype, device=device, operations=operations)
             for i in range(depth)
         ])
-        self.final_layer = T2IFinalLayer(hidden_size, patch_size, self.out_channels)
+        self.final_layer = T2IFinalLayer(hidden_size, patch_size, self.out_channels, dtype=dtype, device=device, operations=operations)
 
-        self.initialize_weights()
+        # self.initialize_weights()
 
         print(f'Warning: lewei scale: {self.lewei_scale}, base size: {self.base_size}')
 
@@ -137,8 +144,8 @@ class PixArt(nn.Module):
         else:
             y_lens = [y.shape[2]] * y.shape[0]
             y = y.squeeze(1).view(1, -1, x.shape[-1])
-        for block in self.blocks:
-            x = auto_grad_checkpoint(block, x, y, t0, y_lens)  # (N, T, D) #support grad checkpoint
+        # for block in self.blocks:
+            # x = auto_grad_checkpoint(block, x, y, t0, y_lens)  # (N, T, D) #support grad checkpoint
         x = self.final_layer(x, t)  # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)  # (N, out_channels, H, W)
         return x

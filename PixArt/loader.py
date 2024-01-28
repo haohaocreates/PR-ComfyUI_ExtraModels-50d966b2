@@ -3,6 +3,7 @@ import comfy.latent_formats
 import comfy.model_patcher
 import comfy.model_base
 import comfy.utils
+import comfy.ops
 import torch
 from comfy import model_management
 from .diffusers_convert import convert_state_dict
@@ -38,17 +39,31 @@ def load_pixart(model_path, model_conf):
 
 	parameters = comfy.utils.calculate_parameters(state_dict)
 	unet_dtype = model_management.unet_dtype(model_params=parameters)
+	load_device = comfy.model_management.get_torch_device()
 
 	model_conf = EXM_PixArt(model_conf) # convert to object
 	model = comfy.model_base.BaseModel(
 		model_conf,
 		model_type=comfy.model_base.ModelType.EPS,
-		device=model_management.get_torch_device()
+		device=load_device
 	)
+
+	manual_cast_dtype = model_management.unet_manual_cast(unet_dtype, load_device)
+	if manual_cast_dtype:
+		model_conf.set_manual_cast(manual_cast_dtype)
+		model.manual_cast_dtype = manual_cast_dtype
+		operations = comfy.ops.manual_cast
+	else:
+		operations = comfy.ops.disable_weight_init
 
 	if model_conf.model_target == "PixArtMS":
 		from .models.PixArtMS import PixArtMS
-		model.diffusion_model = PixArtMS(**model_conf.unet_config)
+		model.diffusion_model = PixArtMS(
+			dtype=unet_dtype,
+			device=load_device,
+			operations=operations,
+			**model_conf.unet_config
+		)
 	elif model_conf.model_target == "PixArt":
 		from .models.PixArt import PixArt
 		model.diffusion_model = PixArt(**model_conf.unet_config)
@@ -58,13 +73,12 @@ def load_pixart(model_path, model_conf):
 	m, u = model.diffusion_model.load_state_dict(state_dict, strict=False)
 	if len(m) > 0: print("Missing UNET keys", m)
 	if len(u) > 0: print("Leftover UNET keys", u)
-	model.diffusion_model.dtype = unet_dtype
 	model.diffusion_model.eval()
-	model.diffusion_model.to(unet_dtype)
+	# model.diffusion_model.to(unet_dtype)
 
 	model_patcher = comfy.model_patcher.ModelPatcher(
 		model,
-		load_device    = comfy.model_management.get_torch_device(),
+		load_device    = load_device,
 		offload_device = comfy.model_management.unet_offload_device(),
 		current_device = "cpu",
 	)

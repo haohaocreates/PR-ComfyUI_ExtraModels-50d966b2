@@ -11,11 +11,14 @@
 import math
 import torch
 import torch.nn as nn
-from timm.models.vision_transformer import Mlp, Attention as Attention_
+from timm.models.vision_transformer import Attention as Attention_
 from einops import rearrange, repeat
 
-from .utils import add_decomposed_rel_pos
+from .utils import add_decomposed_rel_pos, to_2tuple
 from comfy import model_management
+
+import comfy.ops
+ops = comfy.ops.disable_weight_init
 
 if model_management.xformers_enabled():
     import xformers
@@ -31,7 +34,7 @@ def t2i_modulate(x, shift, scale):
 competent_attention_implementation = False
 
 class MultiHeadCrossAttention(nn.Module):
-    def __init__(self, d_model, num_heads, attn_drop=0., proj_drop=0., **block_kwargs):
+    def __init__(self, d_model, num_heads, attn_drop=0., proj_drop=0., dtype=None, device=None, operations=ops, **block_kwargs):
         super(MultiHeadCrossAttention, self).__init__()
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
 
@@ -39,10 +42,10 @@ class MultiHeadCrossAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
 
-        self.q_linear = nn.Linear(d_model, d_model)
-        self.kv_linear = nn.Linear(d_model, d_model*2)
+        self.q_linear = nn.Linear(d_model, d_model, dtype=dtype, device=device)
+        self.kv_linear = nn.Linear(d_model, d_model*2, dtype=dtype, device=device)
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(d_model, d_model)
+        self.proj = nn.Linear(d_model, d_model, dtype=dtype, device=device)
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x, cond, mask=None):
@@ -189,13 +192,13 @@ class FinalLayer(nn.Module):
     The final layer of PixArt.
     """
 
-    def __init__(self, hidden_size, patch_size, out_channels):
+    def __init__(self, hidden_size, patch_size, out_channels, dtype=None, device=None, operations=ops):
         super().__init__()
-        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
+        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
+        self.linear = operations.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True, dtype=dtype, device=device)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+            operations.Linear(hidden_size, 2 * hidden_size, bias=True, dtype=dtype, device=device)
         )
 
     def forward(self, x, c):
@@ -210,10 +213,10 @@ class T2IFinalLayer(nn.Module):
     The final layer of PixArt.
     """
 
-    def __init__(self, hidden_size, patch_size, out_channels):
+    def __init__(self, hidden_size, patch_size, out_channels, dtype=None, device=None, operations=ops):
         super().__init__()
-        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
+        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
+        self.linear = operations.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True, dtype=dtype, device=device)
         self.scale_shift_table = nn.Parameter(torch.randn(2, hidden_size) / hidden_size ** 0.5)
         self.out_channels = out_channels
 
@@ -229,13 +232,13 @@ class MaskFinalLayer(nn.Module):
     The final layer of PixArt.
     """
 
-    def __init__(self, final_hidden_size, c_emb_size, patch_size, out_channels):
+    def __init__(self, final_hidden_size, c_emb_size, patch_size, out_channels, dtype=None, device=None, operations=ops):
         super().__init__()
-        self.norm_final = nn.LayerNorm(final_hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(final_hidden_size, patch_size * patch_size * out_channels, bias=True)
+        self.norm_final = operations.LayerNorm(final_hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
+        self.linear = operations.Linear(final_hidden_size, patch_size * patch_size * out_channels, bias=True, dtype=dtype, device=device)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(c_emb_size, 2 * final_hidden_size, bias=True)
+            operations.Linear(c_emb_size, 2 * final_hidden_size, bias=True, dtype=dtype, device=device)
         )
     def forward(self, x, t):
         shift, scale = self.adaLN_modulation(t).chunk(2, dim=1)
@@ -249,13 +252,13 @@ class DecoderLayer(nn.Module):
     The final layer of PixArt.
     """
 
-    def __init__(self, hidden_size, decoder_hidden_size):
+    def __init__(self, hidden_size, decoder_hidden_size, dtype=None, device=None, operations=ops):
         super().__init__()
-        self.norm_decoder = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(hidden_size, decoder_hidden_size, bias=True)
+        self.norm_decoder = operations.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
+        self.linear = operations.Linear(hidden_size, decoder_hidden_size, bias=True, dtype=dtype, device=device)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+            operations.Linear(hidden_size, 2 * hidden_size, bias=True, dtype=dtype, device=device)
         )
     def forward(self, x, t):
         shift, scale = self.adaLN_modulation(t).chunk(2, dim=1)
@@ -272,12 +275,12 @@ class TimestepEmbedder(nn.Module):
     Embeds scalar timesteps into vector representations.
     """
 
-    def __init__(self, hidden_size, frequency_embedding_size=256):
+    def __init__(self, hidden_size, frequency_embedding_size=256, dtype=None, device=None, operations=ops):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            operations.Linear(frequency_embedding_size, hidden_size, bias=True, dtype=dtype, device=device),
             nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
+            operations.Linear(hidden_size, hidden_size, bias=True, dtype=dtype, device=device),
         )
         self.frequency_embedding_size = frequency_embedding_size
 
@@ -312,12 +315,12 @@ class SizeEmbedder(TimestepEmbedder):
     Embeds scalar timesteps into vector representations.
     """
 
-    def __init__(self, hidden_size, frequency_embedding_size=256):
+    def __init__(self, hidden_size, frequency_embedding_size=256, dtype=None, device=None, operations=ops):
         super().__init__(hidden_size=hidden_size, frequency_embedding_size=frequency_embedding_size)
         self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            operations.Linear(frequency_embedding_size, hidden_size, bias=True, dtype=dtype, device=device),
             nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
+            operations.Linear(hidden_size, hidden_size, bias=True, dtype=dtype, device=device),
         )
         self.frequency_embedding_size = frequency_embedding_size
         self.outdim = hidden_size
@@ -373,9 +376,9 @@ class CaptionEmbedder(nn.Module):
     Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
     """
 
-    def __init__(self, in_channels, hidden_size, uncond_prob, act_layer=nn.GELU(approximate='tanh'), token_num=120):
+    def __init__(self, in_channels, hidden_size, uncond_prob, act_layer=nn.GELU(approximate='tanh'), token_num=120, dtype=None, device=None, operations=ops):
         super().__init__()
-        self.y_proj = Mlp(in_features=in_channels, hidden_features=hidden_size, out_features=hidden_size, act_layer=act_layer, drop=0)
+        self.y_proj = Mlp(in_features=in_channels, hidden_features=hidden_size, out_features=hidden_size, act_layer=act_layer, drop=0, dtype=dtype, device=device, operations=operations)
         self.register_buffer("y_embedding", nn.Parameter(torch.randn(token_num, in_channels) / in_channels ** 0.5))
         self.uncond_prob = uncond_prob
 
@@ -432,3 +435,74 @@ class CaptionEmbedderDoubleBr(nn.Module):
             global_caption, caption = self.token_drop(global_caption, caption, force_drop_ids)
         y_embed = self.proj(global_caption)
         return y_embed, caption
+
+#
+# these are from the timm package, adapted to use comfy.ops
+#
+class Mlp(nn.Module):
+    """
+    MLP as used in Vision Transformer, MLP-Mixer and related networks
+    Hacked together by / Copyright 2020 Ross Wightman
+    """
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, bias=True, drop=0., dtype=None, device=None, operations=ops):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        bias = to_2tuple(bias)
+        drop_probs = to_2tuple(drop)
+
+        self.fc1 = operations.Linear(in_features, hidden_features, bias=bias[0], dtype=dtype, device=device)
+        self.act = act_layer()
+        self.drop1 = nn.Dropout(drop_probs[0])
+        self.fc2 = operations.Linear(hidden_features, out_features, bias=bias[1], dtype=dtype, device=device)
+        self.drop2 = nn.Dropout(drop_probs[1])
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop1(x)
+        x = self.fc2(x)
+        x = self.drop2(x)
+        return x
+
+class PatchEmbed(nn.Module):
+    """
+    Image to Patch Embedding using Conv2d
+    A convolution based approach to patchifying a 2D image w/ embedding projection.
+    Based on the impl in https://github.com/google-research/vision_transformer
+    Hacked together by / Copyright 2020 Ross Wightman
+    """
+    def __init__(
+            self,
+            img_size=224,
+            patch_size=16,
+            in_chans=3,
+            embed_dim=768,
+            norm_layer=None,
+            flatten=True,
+            bias=True,
+            dtype=None,
+            device=None,
+            operations=ops,
+    ):
+        super().__init__()
+        img_size = to_2tuple(img_size)
+        patch_size = to_2tuple(patch_size)
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.grid_size = (img_size[0] // patch_size[0], img_size[1] // patch_size[1])
+        self.num_patches = self.grid_size[0] * self.grid_size[1]
+        self.flatten = flatten
+
+        self.proj = operations.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, bias=bias, dtype=dtype, device=device)
+        self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        assert(H == self.img_size[0], f"Input image height ({H}) doesn't match model ({self.img_size[0]}).")
+        assert(W == self.img_size[1], f"Input image width ({W}) doesn't match model ({self.img_size[1]}).")
+        x = self.proj(x)
+        if self.flatten:
+            x = x.flatten(2).transpose(1, 2)  # BCHW -> BNC
+        x = self.norm(x)
+        return x
